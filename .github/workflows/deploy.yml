@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Deploy to DigitalOcean via SSH
+    - name: Deploy via SSH
       uses: appleboy/ssh-action@v0.1.6
       with:
         host: 159.223.166.147
