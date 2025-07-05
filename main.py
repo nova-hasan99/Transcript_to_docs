@@ -67,7 +67,7 @@ def generate_docs():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/ping', methods=['GET'])
+@app.route( '/ping', methods=['GET'] )
 def ping():
     return jsonify({'message': 'API is working!'}), 200
 
