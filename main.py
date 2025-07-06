@@ -22,7 +22,6 @@ def format_value(key, value):
 
 @app.route('/generate-docs', methods=['POST'])
 def generate_docs():
-    zip_buffer = io.BytesIO()
     try:
         if 'json_data' not in request.files:
             return jsonify({'error': 'Missing json_data file in form-data'}), 400
@@ -37,6 +36,7 @@ def generate_docs():
         raw_channel_name = data[0].get('channelName', 'output_docs')
         zip_name = sanitize_filename(raw_channel_name) or 'output_docs'
 
+        zip_buffer = io.BytesIO()
         zip_file = zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED)
 
         used_titles = set()
@@ -46,7 +46,7 @@ def generate_docs():
             title = item.get('title', 'Untitled')
             safe_title = sanitize_filename(title)
 
-            # ইউনিক নাম গঠন
+            # ইউনিক নাম তৈরি করো
             if safe_title in used_titles:
                 count[safe_title] = count.get(safe_title, 1) + 1
                 safe_title = f"{safe_title}_{count[safe_title]}"
@@ -69,6 +69,7 @@ def generate_docs():
         zip_file.close()
         zip_buffer.seek(0)
 
+        # এখানে close() করো না, Flask নিজেই close করে
         return send_file(
             zip_buffer,
             as_attachment=True,
@@ -78,8 +79,6 @@ def generate_docs():
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-    finally:
-        zip_buffer.close()  # memory leak ঠেকায়
 
 @app.route('/ping', methods=['GET'])
 def ping():
