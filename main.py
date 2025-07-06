@@ -22,6 +22,7 @@ def format_value(key, value):
 
 @app.route('/generate-docs', methods=['POST'])
 def generate_docs():
+    zip_buffer = io.BytesIO()
     try:
         if 'json_data' not in request.files:
             return jsonify({'error': 'Missing json_data file in form-data'}), 400
@@ -35,14 +36,22 @@ def generate_docs():
 
         raw_channel_name = data[0].get('channelName', 'output_docs')
         zip_name = sanitize_filename(raw_channel_name) or 'output_docs'
-        zip_buffer = io.BytesIO()
 
-        # 💡 important: do NOT close BytesIO or leave context too early
         zip_file = zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED)
+
+        used_titles = set()
+        count = {}
 
         for item in data:
             title = item.get('title', 'Untitled')
             safe_title = sanitize_filename(title)
+
+            # ইউনিক নাম গঠন
+            if safe_title in used_titles:
+                count[safe_title] = count.get(safe_title, 1) + 1
+                safe_title = f"{safe_title}_{count[safe_title]}"
+            else:
+                used_titles.add(safe_title)
 
             doc = Document()
             doc.add_heading(title, level=1)
@@ -55,9 +64,9 @@ def generate_docs():
             doc_bytes.seek(0)
 
             zip_file.writestr(f"{safe_title}.docx", doc_bytes.read())
-            doc_bytes.close()  # optional but good practice
+            doc_bytes.close()
 
-        zip_file.close()  # ✅ Must close before send_file
+        zip_file.close()
         zip_buffer.seek(0)
 
         return send_file(
@@ -69,6 +78,8 @@ def generate_docs():
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+    finally:
+        zip_buffer.close()  # memory leak ঠেকায়
 
 @app.route('/ping', methods=['GET'])
 def ping():
