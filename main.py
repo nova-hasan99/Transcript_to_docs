@@ -8,6 +8,9 @@ import json
 
 app = Flask(__name__)
 
+# Set maximum request body size to 200MB
+app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB
+
 # Function to sanitize file or folder names
 def sanitize_filename(name):
     return re.sub(r'[\\/*?:"<>|\']+', '', name).strip()[:50]
@@ -25,9 +28,12 @@ def format_value(key, value):
 @app.route('/generate-docs', methods=['POST'])
 def generate_docs():
     try:
-        json_str = request.form.get('json_data')
-        if not json_str:
-            return jsonify({'error': 'Missing json_data field in form-data'}), 400
+        # ✅ Read JSON from uploaded file
+        if 'json_data' in request.files:
+            json_file = request.files['json_data']
+            json_str = json_file.read().decode('utf-8')
+        else:
+            return jsonify({'error': 'Missing json_data file in form-data'}), 400
 
         data = json.loads(json_str)
         if not isinstance(data, list) or len(data) == 0:
@@ -65,7 +71,6 @@ def generate_docs():
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
 
 @app.route('/ping', methods=['GET'])
 def ping():
