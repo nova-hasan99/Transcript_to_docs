@@ -5,6 +5,7 @@ import re
 import io
 import zipfile
 import json
+import csv
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB
@@ -46,7 +47,6 @@ def generate_docs():
             title = item.get('title', 'Untitled')
             safe_title = sanitize_filename(title)
 
-            # ইউনিক নাম তৈরি করো
             if safe_title in used_titles:
                 count[safe_title] = count.get(safe_title, 1) + 1
                 safe_title = f"{safe_title}_{count[safe_title]}"
@@ -66,10 +66,19 @@ def generate_docs():
             zip_file.writestr(f"{safe_title}.docx", doc_bytes.read())
             doc_bytes.close()
 
+        # ✅ Add CSV summary file
+        csv_buffer = io.StringIO()
+        fieldnames = data[0].keys()
+        writer = csv.DictWriter(csv_buffer, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(data)
+        csv_buffer.seek(0)
+        zip_file.writestr("all_data.csv", csv_buffer.read())
+        csv_buffer.close()
+
         zip_file.close()
         zip_buffer.seek(0)
 
-        # এখানে close() করো না, Flask নিজেই close করে
         return send_file(
             zip_buffer,
             as_attachment=True,
@@ -78,7 +87,7 @@ def generate_docs():
         )
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': f"Server Error: {str(e)}"}), 500
 
 @app.route('/ping', methods=['GET'])
 def ping():
