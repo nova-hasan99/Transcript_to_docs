@@ -14,64 +14,36 @@
 # ============================================
 
 
-import os
+
 import logging
-from logging.handlers import RotatingFileHandler
-from datetime import datetime, timedelta
-from flask import Blueprint, jsonify, request
+import os
+from flask import Blueprint, jsonify
 
-error_log_bp = Blueprint('error_log', __name__)
-log_dir = 'logs'
-log_file_path = os.path.join(log_dir, 'flask.log')
+log_file_path = 'logs/flask.log'
+os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
 
-# === Logging Setup ===
-if not os.path.exists(log_dir):
-    os.mkdir(log_dir)
-
-log_handler = RotatingFileHandler(log_file_path, maxBytes=2 * 1024 * 1024, backupCount=1)
-log_handler.setLevel(logging.ERROR)
-formatter = logging.Formatter('[%(asctime)s] %(levelname)s in %(module)s: %(message)s')
-log_handler.setFormatter(formatter)
-
-# Expose the handler for external use (like in main.py)
 logger = logging.getLogger('flask_error_logger')
 logger.setLevel(logging.ERROR)
-logger.addHandler(log_handler)
 
+file_handler = logging.FileHandler(log_file_path)
+file_handler.setLevel(logging.ERROR)
 
-# === /error-log endpoint ===
-@error_log_bp.route("/error-log", methods=["GET"])
-def get_error_log():
-    if not os.path.exists(log_file_path):
-        return jsonify({"error": "flask.log file not found"}), 404
+formatter = logging.Formatter('[%(asctime)s] %(levelname)s in %(module)s: %(message)s')
+file_handler.setFormatter(formatter)
 
-    lines = request.args.get('lines', default=None, type=int)
-    minutes = request.args.get('minutes', default=None, type=int)
+if not logger.hasHandlers():
+    logger.addHandler(file_handler)
 
-    with open(log_file_path, 'r') as f:
-        log_lines = f.readlines()
+error_log_bp = Blueprint("error_log", __name__)
 
-    result = []
-
-    if minutes:
-        cutoff = datetime.now() - timedelta(minutes=minutes)
-        for line in reversed(log_lines):
-            try:
-                timestamp_str = line.split(']')[0].strip('[')
-                timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S,%f')
-                if timestamp >= cutoff:
-                    result.insert(0, line.strip())
-                else:
-                    break
-            except:
-                continue
-    elif lines:
-        result = log_lines[-lines:]
-    else:
-        result = log_lines[-20:]  # default
-
-    return jsonify({
-        "log_count": len(result),
-        "logs": result
-    })
-
+@error_log_bp.route('/error-log', methods=["GET"])
+def read_error_log():
+    try:
+        with open(log_file_path, "r") as f:
+            lines = f.readlines()
+            return jsonify({
+                "log_count": len(lines),
+                "logs": lines[-50:]  # last 50 lines
+            })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
