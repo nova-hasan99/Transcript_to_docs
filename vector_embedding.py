@@ -4,7 +4,7 @@ import time
 from datetime import datetime
 import openai
 import requests
-from flask import jsonify, current_app  # ⬅️ added current_app for logging
+from flask import current_app
 
 # ========= Utility Functions =========
 
@@ -43,25 +43,20 @@ def batch_embed_text(chunks, openai_key, max_batch_size=980, max_retries=5):
                 embeddings.extend(batch_embeddings)
                 break
             except openai.error.RateLimitError as e:
-                error_message = str(e)
-                print(f"Rate limit hit on batch {i}: {error_message}")
-                wait_time = 10
-                if 'try again in' in error_message:
-                    try:
-                        wait_time = float(error_message.split('try again in')[1].split('s')[0].strip())
-                    except:
-                        wait_time = 10
-                time.sleep(max(wait_time, 10))
+                current_app.logger.warning(f"[OpenAI Retry {attempt+1}] RateLimit: {str(e)}")
+                time.sleep(10)
                 attempt += 1
             except Exception as e:
-                raise RuntimeError(f"OpenAI batch embedding failed at batch index {i}: {str(e)}")
+                current_app.logger.error(f"[OpenAI Retry {attempt+1}] Failed: {str(e)}", exc_info=True)
+                time.sleep(10)
+                attempt += 1
 
         if attempt > max_retries:
-            raise RuntimeError(f"Failed after {max_retries} retries on batch {i}")
+            current_app.logger.error(f"[OpenAI] Gave up after {max_retries} retries on batch {i}")
 
     return embeddings
 
-def insert_into_supabase(supabase_url, supabase_key, table, records):
+def insert_into_supabase(supabase_url, supabase_key, table, records, batch_size=100, max_retries=5):
     url = f"{supabase_url}/rest/v1/{table}"
     headers = {
         "apikey": supabase_key,
@@ -69,9 +64,24 @@ def insert_into_supabase(supabase_url, supabase_key, table, records):
         "Content-Type": "application/json",
         "Prefer": "return=minimal"
     }
-    response = requests.post(url, headers=headers, json=records)
-    if not response.ok:
-        raise RuntimeError(f"Supabase insert failed: {response.text}")
+
+    for i in range(0, len(records), batch_size):
+        sub_records = records[i:i + batch_size]
+        attempt = 0
+        while attempt <= max_retries:
+            try:
+                response = requests.post(url, headers=headers, json=sub_records)
+                if response.ok:
+                    break
+                else:
+                    current_app.logger.warning(f"[Supabase Retry {attempt+1}] Failed: {response.text}")
+            except Exception as e:
+                current_app.logger.warning(f"[Supabase Retry {attempt+1}] Exception: {str(e)}")
+            time.sleep(10)
+            attempt += 1
+
+        if attempt > max_retries:
+            current_app.logger.error(f"[Supabase] Gave up after {max_retries} retries on batch {i}")
 
 def download_json_from_url(file_url):
     try:
@@ -81,47 +91,25 @@ def download_json_from_url(file_url):
     except Exception as e:
         raise RuntimeError(f"Failed to download file: {e}")
 
-# ========= Main Handler =========
+# ========= Background Task Handler =========
 
-def process_upload_request(request):
+def process_upload_task(data):
     try:
-        # Step 1: Headers
-        openai_key = request.headers.get('x-openai-api-key')
-        supabase_url = request.headers.get('x-supabase-url')
-        supabase_key = request.headers.get('x-supabase-key')
-        if not all([openai_key, supabase_url, supabase_key]):
-            return jsonify({'error': 'Missing required headers'}), 400
+        openai_key = data["openai_key"]
+        supabase_url = data["supabase_url"]
+        supabase_key = data["supabase_key"]
+        file_url = data["file_url"]
+        content_field = data.get("content_field", "captions")
+        chunk_size = int(data.get("chunk_size", 500))
+        chunk_overlap = int(data.get("chunk_overlap", 50))
+        supabase_table = data.get("supabase_table", "documents")
+        metadata_map = data.get("metadata_map", {})
 
-        # Step 2: Get File URL
-        file_url = request.form.get('json_url')
-        if not file_url:
-            return jsonify({'error': 'Missing form field: json_url'}), 400
+        json_str = download_json_from_url(file_url)
+        json_data = json.loads(json_str)
 
-        try:
-            json_str = download_json_from_url(file_url)
-            json_data = json.loads(json_str)
-        except Exception as e:
-            return jsonify({'error': 'Invalid JSON file from URL', 'details': str(e)}), 400
-
-        if not isinstance(json_data, list) or len(json_data) == 0:
-            return jsonify({'error': 'Uploaded JSON must be a non-empty list'}), 400
-
-        # Step 3: Optional Inputs
-        content_field = request.form.get('content_field', 'captions')
-        chunk_size = int(request.form.get('chunk_size', 500) or 500)
-        chunk_overlap = int(request.form.get('chunk_overlap', 50) or 50)
-        supabase_table = request.form.get('supabase_table', 'documents')
-
-        metadata_map = {}
-        metadata_raw = request.form.get('metadata')
-        if metadata_raw:
-            try:
-                metadata_map = json.loads(metadata_raw)
-            except Exception as e:
-                return jsonify({'error': 'Invalid metadata JSON', 'details': str(e)}), 400
-
-        # Step 4: Batch loop
         max_batch_size = 980
+        supabase_batch_size = 100
         batch_chunks = []
         batch_metadata = []
         total_uploaded = 0
@@ -129,14 +117,24 @@ def process_upload_request(request):
         for item in json_data:
             raw = item.get(content_field)
             content = raw.strip() if isinstance(raw, str) else ''
-            if not content:
-                continue
-
-            chunks = chunk_text(content, chunk_size, chunk_overlap)
             metadata = {
                 k: format_metadata_value(k, item.get(v))
                 for k, v in metadata_map.items()
             } if metadata_map else {}
+
+            if not content:
+                # Insert null content/embedding
+                record = {
+                    "content": None,
+                    "metadata": metadata,
+                    "embedding": None,
+                    "created_at": datetime.utcnow().isoformat()
+                }
+                insert_into_supabase(supabase_url, supabase_key, supabase_table, [record])
+                total_uploaded += 1
+                continue
+
+            chunks = chunk_text(content, chunk_size, chunk_overlap)
 
             for chunk in chunks:
                 batch_chunks.append(chunk)
@@ -153,7 +151,7 @@ def process_upload_request(request):
                         }
                         for i in range(len(batch_chunks))
                     ]
-                    insert_into_supabase(supabase_url, supabase_key, supabase_table, records)
+                    insert_into_supabase(supabase_url, supabase_key, supabase_table, records, supabase_batch_size)
                     total_uploaded += len(records)
                     batch_chunks, batch_metadata = [], []
 
@@ -169,11 +167,10 @@ def process_upload_request(request):
                 }
                 for i in range(len(batch_chunks))
             ]
-            insert_into_supabase(supabase_url, supabase_key, supabase_table, records)
+            insert_into_supabase(supabase_url, supabase_key, supabase_table, records, supabase_batch_size)
             total_uploaded += len(records)
 
-        return jsonify({"status": "success", "records_uploaded": total_uploaded}), 200
+        current_app.logger.info(f"[UPLOAD DONE] ✅ {total_uploaded} records uploaded.")
 
     except Exception as e:
-        current_app.logger.error(f"Unexpected error in upload-flexible: {str(e)}", exc_info=True)
-        return jsonify({"error": "Unexpected failure", "details": str(e)}), 500
+        current_app.logger.error(f"[TASK ERROR] {str(e)}", exc_info=True)
