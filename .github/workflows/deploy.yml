@@ -18,7 +18,8 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
             cd /root/Transcript_to_docs
-            git reset --hard
+            git fetch --all
+            git checkout main
             git pull origin main
             source venv/bin/activate
             pip install -r requirements.txt
