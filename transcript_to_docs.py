@@ -3,6 +3,7 @@ import io
 import zipfile
 import json
 import csv
+import requests
 from docx import Document
 from flask import jsonify, send_file
 
@@ -17,18 +18,32 @@ def format_value(key, value):
         return f"https://www.youtube.com/watch?v={value}"
     return value or ''
 
+def download_json_from_url(file_url):
+    try:
+        response = requests.get(file_url)
+        response.raise_for_status()
+        return response.content.decode('utf-8')
+    except Exception as e:
+        raise RuntimeError(f"Failed to download file: {e}")
+
 def generate_zip_from_transcript(request):
     try:
-        if 'json_data' not in request.files:
-            return jsonify({'error': 'Missing json_data file in form-data'}), 400
+        # Step 1: Check for form field
+        file_url = request.form.get('json_url')
+        if not file_url:
+            return jsonify({'error': 'Missing form-data field: json_url'}), 400
 
-        json_file = request.files['json_data']
-        json_str = json_file.read().decode('utf-8')
+        # Step 2: Download and parse JSON
+        try:
+            json_str = download_json_from_url(file_url)
+            data = json.loads(json_str)
+        except Exception as e:
+            return jsonify({'error': 'Invalid JSON file from URL', 'details': str(e)}), 400
 
-        data = json.loads(json_str)
         if not isinstance(data, list) or len(data) == 0:
             return jsonify({'error': 'Invalid JSON payload. Must be a non-empty list.'}), 400
 
+        # Step 3: Prepare zip name
         raw_channel_name = data[0].get('channelName', 'output_docs')
         zip_name = sanitize_filename(raw_channel_name) or 'output_docs'
 

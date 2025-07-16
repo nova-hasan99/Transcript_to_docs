@@ -73,6 +73,14 @@ def insert_into_supabase(supabase_url, supabase_key, table, records):
     if not response.ok:
         raise RuntimeError(f"Supabase insert failed: {response.text}")
 
+def download_json_from_url(file_url):
+    try:
+        response = requests.get(file_url)
+        response.raise_for_status()
+        return response.content.decode('utf-8')
+    except Exception as e:
+        raise RuntimeError(f"Failed to download file: {e}")
+
 # ========= Main Handler =========
 
 def process_upload_request(request):
@@ -84,16 +92,16 @@ def process_upload_request(request):
         if not all([openai_key, supabase_url, supabase_key]):
             return jsonify({'error': 'Missing required headers'}), 400
 
-        # Step 2: Binary JSON
-        if 'json_data' not in request.files:
-            return jsonify({'error': 'Missing binary file field: json_data'}), 400
+        # Step 2: Get File URL
+        file_url = request.form.get('json_url')
+        if not file_url:
+            return jsonify({'error': 'Missing form field: json_url'}), 400
 
         try:
-            json_file = request.files['json_data']
-            json_str = json_file.read().decode('utf-8')
+            json_str = download_json_from_url(file_url)
             json_data = json.loads(json_str)
         except Exception as e:
-            return jsonify({'error': 'Invalid JSON file', 'details': str(e)}), 400
+            return jsonify({'error': 'Invalid JSON file from URL', 'details': str(e)}), 400
 
         if not isinstance(json_data, list) or len(json_data) == 0:
             return jsonify({'error': 'Uploaded JSON must be a non-empty list'}), 400
