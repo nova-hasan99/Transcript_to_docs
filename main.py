@@ -1,9 +1,17 @@
 from flask import Flask, request, jsonify, send_file
 from vector_embedding import process_upload_request
 from transcript_to_docs import generate_zip_from_transcript
+from error_log import error_log_bp, logger  # Import error log route and logger
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB max upload size
+
+# Attach the external logger to app
+app.logger.handlers = logger.handlers
+app.logger.setLevel(logger.level)
+
+# === Register Blueprints ===
+app.register_blueprint(error_log_bp)
 
 # === Health Check ===
 @app.route("/ping", methods=["GET"])
