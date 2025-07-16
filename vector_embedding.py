@@ -4,7 +4,7 @@ import time
 from datetime import datetime
 import openai
 import requests
-from flask import jsonify
+from flask import jsonify, current_app  # ⬅️ added current_app for logging
 
 # ========= Utility Functions =========
 
@@ -175,5 +175,5 @@ def process_upload_request(request):
         return jsonify({"status": "success", "records_uploaded": total_uploaded}), 200
 
     except Exception as e:
-        print("ERROR:", e)
+        current_app.logger.error(f"Unexpected error in upload-flexible: {str(e)}", exc_info=True)
         return jsonify({"error": "Unexpected failure", "details": str(e)}), 500

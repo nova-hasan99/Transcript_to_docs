@@ -5,7 +5,7 @@ import json
 import csv
 import requests
 from docx import Document
-from flask import jsonify, send_file
+from flask import jsonify, send_file, current_app  # ⬅️ added for logging
 
 def sanitize_filename(name):
     return re.sub(r'[\\/*?:"<>|\']+', '', name).strip()[:50]
@@ -95,4 +95,5 @@ def generate_zip_from_transcript(request):
         )
 
     except Exception as e:
+        current_app.logger.error(f"Unexpected error in generate-docs: {str(e)}", exc_info=True)
         return jsonify({'error': f"Server Error: {str(e)}"}), 500
