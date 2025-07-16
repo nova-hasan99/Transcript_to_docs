@@ -28,6 +28,10 @@ def upload_flexible():
 def generate_docs():
     return generate_zip_from_transcript(request)
 
+@app.route("/force-error")
+def force_error():
+    raise ValueError("Test error logging from /force-error")
+
 # === Run Server ===
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    app.run(debug=False, port=5000)
