@@ -5,6 +5,7 @@ from datetime import datetime
 import openai
 import requests
 from flask import current_app
+from man import app  # Import your Flask app to access app context
 
 # ========= Utility Functions =========
 
@@ -94,83 +95,84 @@ def download_json_from_url(file_url):
 # ========= Background Task Handler =========
 
 def process_upload_task(data):
-    try:
-        openai_key = data["openai_key"]
-        supabase_url = data["supabase_url"]
-        supabase_key = data["supabase_key"]
-        file_url = data["file_url"]
-        content_field = data.get("content_field", "captions")
-        chunk_size = int(data.get("chunk_size", 500))
-        chunk_overlap = int(data.get("chunk_overlap", 50))
-        supabase_table = data.get("supabase_table", "documents")
-        metadata_map = data.get("metadata_map", {})
+    with app.app_context():  # ✅ Use app context for logging
+        try:
+            openai_key = data["openai_key"]
+            supabase_url = data["supabase_url"]
+            supabase_key = data["supabase_key"]
+            file_url = data["file_url"]
+            content_field = data.get("content_field", "captions")
+            chunk_size = int(data.get("chunk_size", 500))
+            chunk_overlap = int(data.get("chunk_overlap", 50))
+            supabase_table = data.get("supabase_table", "documents")
+            metadata_map = data.get("metadata_map", {})
 
-        json_str = download_json_from_url(file_url)
-        json_data = json.loads(json_str)
+            json_str = download_json_from_url(file_url)
+            json_data = json.loads(json_str)
 
-        max_batch_size = 980
-        supabase_batch_size = 100
-        batch_chunks = []
-        batch_metadata = []
-        total_uploaded = 0
+            max_batch_size = 980
+            supabase_batch_size = 100
+            batch_chunks = []
+            batch_metadata = []
+            total_uploaded = 0
 
-        for item in json_data:
-            raw = item.get(content_field)
-            content = raw.strip() if isinstance(raw, str) else ''
-            metadata = {
-                k: format_metadata_value(k, item.get(v))
-                for k, v in metadata_map.items()
-            } if metadata_map else {}
+            for item in json_data:
+                raw = item.get(content_field)
+                content = raw.strip() if isinstance(raw, str) else ''
+                metadata = {
+                    k: format_metadata_value(k, item.get(v))
+                    for k, v in metadata_map.items()
+                } if metadata_map else {}
 
-            if not content:
-                # Insert null content/embedding
-                record = {
-                    "content": None,
-                    "metadata": metadata,
-                    "embedding": None,
-                    "created_at": datetime.utcnow().isoformat()
-                }
-                insert_into_supabase(supabase_url, supabase_key, supabase_table, [record])
-                total_uploaded += 1
-                continue
+                if not content:
+                    # Insert null content/embedding
+                    record = {
+                        "content": None,
+                        "metadata": metadata,
+                        "embedding": None,
+                        "created_at": datetime.utcnow().isoformat()
+                    }
+                    insert_into_supabase(supabase_url, supabase_key, supabase_table, [record])
+                    total_uploaded += 1
+                    continue
 
-            chunks = chunk_text(content, chunk_size, chunk_overlap)
+                chunks = chunk_text(content, chunk_size, chunk_overlap)
 
-            for chunk in chunks:
-                batch_chunks.append(chunk)
-                batch_metadata.append(metadata)
+                for chunk in chunks:
+                    batch_chunks.append(chunk)
+                    batch_metadata.append(metadata)
 
-                if len(batch_chunks) >= max_batch_size:
-                    embeddings = batch_embed_text(batch_chunks, openai_key)
-                    records = [
-                        {
-                            "content": batch_chunks[i],
-                            "metadata": batch_metadata[i],
-                            "embedding": embeddings[i],
-                            "created_at": datetime.utcnow().isoformat()
-                        }
-                        for i in range(len(batch_chunks))
-                    ]
-                    insert_into_supabase(supabase_url, supabase_key, supabase_table, records, supabase_batch_size)
-                    total_uploaded += len(records)
-                    batch_chunks, batch_metadata = [], []
+                    if len(batch_chunks) >= max_batch_size:
+                        embeddings = batch_embed_text(batch_chunks, openai_key)
+                        records = [
+                            {
+                                "content": batch_chunks[i],
+                                "metadata": batch_metadata[i],
+                                "embedding": embeddings[i],
+                                "created_at": datetime.utcnow().isoformat()
+                            }
+                            for i in range(len(batch_chunks))
+                        ]
+                        insert_into_supabase(supabase_url, supabase_key, supabase_table, records, supabase_batch_size)
+                        total_uploaded += len(records)
+                        batch_chunks, batch_metadata = [], []
 
-        # Final leftover batch
-        if batch_chunks:
-            embeddings = batch_embed_text(batch_chunks, openai_key)
-            records = [
-                {
-                    "content": batch_chunks[i],
-                    "metadata": batch_metadata[i],
-                    "embedding": embeddings[i],
-                    "created_at": datetime.utcnow().isoformat()
-                }
-                for i in range(len(batch_chunks))
-            ]
-            insert_into_supabase(supabase_url, supabase_key, supabase_table, records, supabase_batch_size)
-            total_uploaded += len(records)
+            # Final leftover batch
+            if batch_chunks:
+                embeddings = batch_embed_text(batch_chunks, openai_key)
+                records = [
+                    {
+                        "content": batch_chunks[i],
+                        "metadata": batch_metadata[i],
+                        "embedding": embeddings[i],
+                        "created_at": datetime.utcnow().isoformat()
+                    }
+                    for i in range(len(batch_chunks))
+                ]
+                insert_into_supabase(supabase_url, supabase_key, supabase_table, records, supabase_batch_size)
+                total_uploaded += len(records)
 
-        current_app.logger.info(f"[UPLOAD DONE] ✅ {total_uploaded} records uploaded.")
+            current_app.logger.info(f"[UPLOAD DONE] ✅ {total_uploaded} records uploaded.")
 
-    except Exception as e:
-        current_app.logger.error(f"[TASK ERROR] {str(e)}", exc_info=True)
+        except Exception as e:
+            current_app.logger.error(f"[TASK ERROR] {str(e)}", exc_info=True)
