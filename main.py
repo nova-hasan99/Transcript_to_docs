@@ -1,26 +1,22 @@
 from flask import Flask, request, jsonify
 from transcript_to_docs import generate_zip_from_transcript
 from error_log import error_log_bp
-from vector_embedding import process_upload_task
+from vector_embedding import process_upload_task  # We will update this soon
 from threading import Thread
 import json
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB max upload
 
-# === Register Error Log Blueprint ===
 app.register_blueprint(error_log_bp)
 
-# === Health Check ===
 @app.route("/ping")
 def ping():
     return jsonify({"message": "pong"}), 200
 
-# === Upload & Embed JSON into Supabase Vector Store ===
 @app.route("/upload-flexible", methods=["POST"])
 def upload_flexible():
     try:
-        # Step 1: Collect data from headers + form
         data = {
             "openai_key": request.headers.get('x-openai-api-key'),
             "supabase_url": request.headers.get('x-supabase-url'),
@@ -33,11 +29,10 @@ def upload_flexible():
             "metadata_map": json.loads(request.form.get('metadata') or '{}')
         }
 
-        # Step 2: Start background thread
-        thread = Thread(target=process_upload_task, args=(data,))
+        # 👇 app context send as argument
+        thread = Thread(target=process_upload_task, args=(app, data))
         thread.start()
 
-        # Step 3: Respond early to avoid Gunicorn timeout
         return jsonify({
             "status": "accepted",
             "message": "Embedding process started in background",
@@ -48,12 +43,10 @@ def upload_flexible():
         app.logger.error(f"Upload request failed: {str(e)}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
-# === DOCX Generator from Transcript JSON ===
 @app.route("/generate-docs", methods=["POST"])
 def generate_docs():
     return generate_zip_from_transcript(request)
 
-# === Force an error for testing ===
 @app.route("/force-error")
 def force_error():
     app.logger.error("Intentional error raised from /force-error")

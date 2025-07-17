@@ -4,8 +4,6 @@ import time
 from datetime import datetime
 import openai
 import requests
-from flask import current_app
-from man import app  # Import your Flask app to access app context
 
 # ========= Utility Functions =========
 
@@ -26,7 +24,7 @@ def format_metadata_value(key, value):
         return f"https://www.youtube.com/watch?v={value}"
     return value or ""
 
-def batch_embed_text(chunks, openai_key, max_batch_size=980, max_retries=5):
+def batch_embed_text(chunks, openai_key, app, max_batch_size=980, max_retries=5):
     openai.api_key = openai_key
     embeddings = []
 
@@ -44,20 +42,20 @@ def batch_embed_text(chunks, openai_key, max_batch_size=980, max_retries=5):
                 embeddings.extend(batch_embeddings)
                 break
             except openai.error.RateLimitError as e:
-                current_app.logger.warning(f"[OpenAI Retry {attempt+1}] RateLimit: {str(e)}")
+                app.logger.warning(f"[OpenAI Retry {attempt+1}] RateLimit: {str(e)}")
                 time.sleep(10)
                 attempt += 1
             except Exception as e:
-                current_app.logger.error(f"[OpenAI Retry {attempt+1}] Failed: {str(e)}", exc_info=True)
+                app.logger.error(f"[OpenAI Retry {attempt+1}] Failed: {str(e)}", exc_info=True)
                 time.sleep(10)
                 attempt += 1
 
         if attempt > max_retries:
-            current_app.logger.error(f"[OpenAI] Gave up after {max_retries} retries on batch {i}")
+            app.logger.error(f"[OpenAI] Gave up after {max_retries} retries on batch {i}")
 
     return embeddings
 
-def insert_into_supabase(supabase_url, supabase_key, table, records, batch_size=100, max_retries=5):
+def insert_into_supabase(supabase_url, supabase_key, table, records, app, batch_size=100, max_retries=5):
     url = f"{supabase_url}/rest/v1/{table}"
     headers = {
         "apikey": supabase_key,
@@ -75,14 +73,14 @@ def insert_into_supabase(supabase_url, supabase_key, table, records, batch_size=
                 if response.ok:
                     break
                 else:
-                    current_app.logger.warning(f"[Supabase Retry {attempt+1}] Failed: {response.text}")
+                    app.logger.warning(f"[Supabase Retry {attempt+1}] Failed: {response.text}")
             except Exception as e:
-                current_app.logger.warning(f"[Supabase Retry {attempt+1}] Exception: {str(e)}")
+                app.logger.warning(f"[Supabase Retry {attempt+1}] Exception: {str(e)}")
             time.sleep(10)
             attempt += 1
 
         if attempt > max_retries:
-            current_app.logger.error(f"[Supabase] Gave up after {max_retries} retries on batch {i}")
+            app.logger.error(f"[Supabase] Gave up after {max_retries} retries on batch {i}")
 
 def download_json_from_url(file_url):
     try:
@@ -94,8 +92,8 @@ def download_json_from_url(file_url):
 
 # ========= Background Task Handler =========
 
-def process_upload_task(data):
-    with app.app_context():  # ✅ Use app context for logging
+def process_upload_task(app, data):
+    with app.app_context():
         try:
             openai_key = data["openai_key"]
             supabase_url = data["supabase_url"]
@@ -125,14 +123,13 @@ def process_upload_task(data):
                 } if metadata_map else {}
 
                 if not content:
-                    # Insert null content/embedding
                     record = {
                         "content": None,
                         "metadata": metadata,
                         "embedding": None,
                         "created_at": datetime.utcnow().isoformat()
                     }
-                    insert_into_supabase(supabase_url, supabase_key, supabase_table, [record])
+                    insert_into_supabase(supabase_url, supabase_key, supabase_table, [record], app)
                     total_uploaded += 1
                     continue
 
@@ -143,7 +140,7 @@ def process_upload_task(data):
                     batch_metadata.append(metadata)
 
                     if len(batch_chunks) >= max_batch_size:
-                        embeddings = batch_embed_text(batch_chunks, openai_key)
+                        embeddings = batch_embed_text(batch_chunks, openai_key, app)
                         records = [
                             {
                                 "content": batch_chunks[i],
@@ -153,13 +150,12 @@ def process_upload_task(data):
                             }
                             for i in range(len(batch_chunks))
                         ]
-                        insert_into_supabase(supabase_url, supabase_key, supabase_table, records, supabase_batch_size)
+                        insert_into_supabase(supabase_url, supabase_key, supabase_table, records, app, supabase_batch_size)
                         total_uploaded += len(records)
                         batch_chunks, batch_metadata = [], []
 
-            # Final leftover batch
             if batch_chunks:
-                embeddings = batch_embed_text(batch_chunks, openai_key)
+                embeddings = batch_embed_text(batch_chunks, openai_key, app)
                 records = [
                     {
                         "content": batch_chunks[i],
@@ -169,10 +165,10 @@ def process_upload_task(data):
                     }
                     for i in range(len(batch_chunks))
                 ]
-                insert_into_supabase(supabase_url, supabase_key, supabase_table, records, supabase_batch_size)
+                insert_into_supabase(supabase_url, supabase_key, supabase_table, records, app, supabase_batch_size)
                 total_uploaded += len(records)
 
-            current_app.logger.info(f"[UPLOAD DONE] ✅ {total_uploaded} records uploaded.")
+            app.logger.info(f"[UPLOAD DONE] ✅ {total_uploaded} records uploaded.")
 
         except Exception as e:
-            current_app.logger.error(f"[TASK ERROR] {str(e)}", exc_info=True)
+            app.logger.error(f"[TASK ERROR] {str(e)}", exc_info=True)
