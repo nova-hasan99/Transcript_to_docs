@@ -3,34 +3,107 @@ import json
 import re
 import time
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Iterable
 
 import requests
 from openai import OpenAI
 import openai
 
-# ==================== Helpers & Utilities ====================
 
-def _parse_key_list(raw: Optional[str]) -> set:
+# ===================== Parsing helpers =====================
+
+def _parse_key_list(raw: Optional[str]) -> List[str]:
     """
-    Accepts either a JSON array string '["caption","description"]'
-    or a comma-separated string 'caption, description'
-    Returns a lower-cased trimmed set of keys.
+    Accepts:
+      - JSON array string: '["caption","metadata.title"]'
+      - JSON string: '"caption, metadata.title"'
+      - CSV string:  'caption, metadata.title'
+    Returns lower-cased, trimmed list of tokens/patterns.
     """
     if not raw:
-        return set()
-    raw = raw.strip()
+        return []
+    s = str(raw).strip()
+    tokens: Iterable[str] = []
     try:
-        data = json.loads(raw)
-        if isinstance(data, list):
-            return {str(x).strip().lower() for x in data if str(x).strip()}
+        parsed = json.loads(s)
+        if isinstance(parsed, list):
+            tokens = parsed
+        elif isinstance(parsed, str):
+            tokens = parsed.split(",")
+        else:
+            tokens = [s]
     except Exception:
-        pass
-    # CSV fallback
-    return {x.strip().lower() for x in raw.split(",") if x.strip()}
+        tokens = s.split(",")
 
-def sanitize(text):
-    return re.sub(r'[\\/*?:"<>|\']+', '', str(text))[:100]
+    out: List[str] = []
+    for t in tokens:
+        tok = str(t).strip().strip('\'"').lower()
+        if tok:
+            out.append(tok)
+    return out
+
+
+def _token_is_simple_name(tok: str) -> bool:
+    """
+    A 'simple name' has no dot, no [index], and no wildcard characters.
+    e.g., 'crawl', 'title', 'property' are simple; 'a.b', 'a[*].b', 'a*' are not.
+    """
+    return all(x not in tok for x in ('.', '[', ']', '*'))
+
+
+def _compile_patterns(raw_tokens: List[str]) -> List[re.Pattern]:
+    """
+    Build compiled regex patterns implementing the semantics:
+
+    - If token is a complex path (has '.', '[', or '*'):
+        Use as-is with wildcards:
+          *   -> .*
+          [*] -> [\\d+]
+      Match is FULL path (re.fullmatch).
+
+    - If token is a simple name, like 'crawl':
+        Interpret as TWO intentions:
+          (A) subtree root     -> ^crawl(\\..*|\\[\\d+\\].*)?$
+          (B) leaf-name anywhere-> (?:^|.*[.\\]])crawl$
+        Both patterns are used (so 'crawl' drops subtree; 'loadedurl' drops leafs named 'loadedUrl' anywhere).
+
+    All matches are case-insensitive (paths are lower-cased before matching).
+    """
+    compiled: List[re.Pattern] = []
+    for tok in raw_tokens:
+        if _token_is_simple_name(tok):
+            # (A) As subtree root
+            subtree_regex = rf"^{re.escape(tok)}(?:\..*|\[\d+\].*)?$"
+            compiled.append(re.compile(subtree_regex))
+            # (B) As leaf name anywhere (end of path segment or [...].leaf)
+            leaf_regex = rf"(?:^|.*[.\]]){re.escape(tok)}$"
+            compiled.append(re.compile(leaf_regex))
+        else:
+            pat = tok
+            esc = re.escape(pat)
+            # translate wildcards
+            esc = esc.replace(r'\[\*\]', r'\[\d+\]')  # [*] => [number]
+            esc = esc.replace(r'\*', r'.*')           # *   => .*
+            compiled.append(re.compile(rf"{esc}"))
+    return compiled
+
+
+def _match_any(path_lc: str, patterns: List[re.Pattern]) -> bool:
+    return any(p.fullmatch(path_lc) for p in patterns)
+
+
+# ===================== Generic utils =====================
+
+def _stringify(v: Any) -> str:
+    if isinstance(v, (str, int, float, bool)):
+        return str(v)
+    if v is None:
+        return ""
+    try:
+        return json.dumps(v, ensure_ascii=False)
+    except Exception:
+        return str(v)
+
 
 def chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
     chunk_size = int(chunk_size)
@@ -40,35 +113,36 @@ def chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
     if chunk_overlap < 0:
         raise ValueError("chunk_overlap must be >= 0")
     if chunk_overlap >= chunk_size:
-        # guard: keep at most 10% overlap if misconfigured
         chunk_overlap = max(0, chunk_size // 10)
 
     chunks = []
-    start = 0
     n = len(text)
+    start = 0
     step = chunk_size - chunk_overlap
     while start < n:
         end = min(start + chunk_size, n)
         piece = text[start:end]
-        if piece and piece.strip():  # skip empty/whitespace-only chunks
+        if piece and piece.strip():
             chunks.append(piece)
         if end == n:
             break
         start += step
     return chunks
 
+
 _YT_ID_RE = re.compile(r'^[A-Za-z0-9_\-]{11}$')
 
 def format_metadata_value(key: str, value: Any):
     if value is None:
         return ""
-    # Example: if someone maps "youtube_id" we auto-expand to URL
     if key.lower() in {"youtube_id", "video_id"} and isinstance(value, str) and _YT_ID_RE.match(value):
         return f"https://www.youtube.com/watch?v={value}"
     return value
 
+
 def _mk_openai_client(api_key: str) -> OpenAI:
     return OpenAI(api_key=api_key)
+
 
 def batch_embed_text(
     chunks: List[str],
@@ -80,7 +154,6 @@ def batch_embed_text(
 ) -> List[List[float]]:
     client = _mk_openai_client(openai_key)
     embeddings: List[List[float]] = []
-
     for i in range(0, len(chunks), max_batch_size):
         batch = chunks[i:i + max_batch_size]
         attempt = 0
@@ -93,7 +166,6 @@ def batch_embed_text(
             except (openai.RateLimitError, openai.APIError, openai.APIConnectionError, openai.InternalServerError) as e:
                 if attempt >= max_retries:
                     app.logger.error(f"[OpenAI] Gave up after {max_retries} retries on batch starting {i}: {e}")
-                    # keep alignment (1536 dims for text-embedding-3-small)
                     embeddings.extend([[0.0] * 1536] * len(batch))
                     break
                 app.logger.warning(f"[OpenAI Retry {attempt+1}] {type(e).__name__}: {str(e)}")
@@ -104,8 +176,8 @@ def batch_embed_text(
                 app.logger.error(f"[OpenAI Unexpected] {e}", exc_info=True)
                 embeddings.extend([[0.0] * 1536] * len(batch))
                 break
-
     return embeddings
+
 
 def insert_into_supabase(
     supabase_url: str,
@@ -127,7 +199,6 @@ def insert_into_supabase(
         "Prefer": "return=minimal"
     }
     sess = session or requests.Session()
-
     for i in range(0, len(records), batch_size):
         sub_records = records[i:i + batch_size]
         attempt = 0
@@ -147,122 +218,176 @@ def insert_into_supabase(
             backoff = min(backoff * 2, 20)
             attempt += 1
 
+
 def download_json_from_url(file_url: str) -> str:
     sess = requests.Session()
     try:
         resp = sess.get(file_url, timeout=60)
         resp.raise_for_status()
-        # keep encoding if present
         return resp.content.decode(resp.encoding or 'utf-8', errors='replace')
     except Exception as e:
         raise RuntimeError(f"Failed to download file: {e}")
 
-# ==================== Core Dynamic Split Logic ====================
 
-def _stringify(v: Any) -> str:
-    if isinstance(v, (str, int, float, bool)):
-        return str(v)
-    if v is None:
+# ===================== Flatten to dot-paths =====================
+
+def flatten_item(obj: Any, parent: str = "") -> Dict[str, str]:
+    """
+    Flattens dicts/lists to dot/idx paths:
+      dict:  parent.child
+      list:  parent[0], parent[1], ...
+    Returns { path: stringified_value } with ORIGINAL path casing preserved.
+    """
+    out: Dict[str, str] = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            key = f"{parent}.{k}" if parent else str(k)
+            out.update(flatten_item(v, key))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            key = f"{parent}[{i}]"
+            out.update(flatten_item(v, key))
+    else:
+        out[parent] = _stringify(obj)
+    return out
+
+# ====================== Path utilities ======================
+
+def _extract_root(path: str) -> str:
+    """
+    'metadata.title'        -> 'metadata'
+    'metadata.openGraph[0]' -> 'metadata'
+    'crawl.loadedUrl'       -> 'crawl'
+    'url'                   -> 'url'
+    """
+    if not path:
         return ""
-    # list/dict → JSON string
-    try:
-        return json.dumps(v, ensure_ascii=False)
-    except Exception:
-        return str(v)
+    p = path
+    # split on first '.' or '['
+    dot = p.find('.')
+    brk = p.find('[')
+    cut = len(p)
+    if dot != -1:
+        cut = min(cut, dot)
+    if brk != -1:
+        cut = min(cut, brk)
+    return p[:cut]
 
-def decide_chunk_or_meta_for_item(
+def _is_related_to_root(meta_key: str, root: str) -> bool:
+    """
+    meta_key may be a path (e.g., 'metadata.title') or a mapped out-key ('title').
+    If it's a path: related iff it starts under the same root.
+    If it's an out-key (no '.' and no '['): we decide via origin map (handled elsewhere).
+    Here we only handle path-like keys.
+    """
+    if not meta_key:
+        return False
+    if ('.' in meta_key) or ('[' in meta_key):
+        mk_lc = meta_key.lower()
+        r_lc  = root.lower()
+        return mk_lc == r_lc or mk_lc.startswith(r_lc + '.') or mk_lc.startswith(r_lc + '[')
+    # non-path keys handled by origin matching in the filter function below
+    return False
+
+
+# ===================== Decision (path-aware) =====================
+
+def decide_chunk_or_meta_for_item_paths(
     item: Dict[str, Any],
     threshold: int,
-    force_chunk_keys: set,
-    force_meta_keys: set,
-    exclude_chunk_keys: set,
-    exclude_meta_keys: set,
+    force_chunk_patterns: List[re.Pattern],
+    force_meta_patterns: List[re.Pattern],
+    exclude_chunk_patterns: List[re.Pattern],
+    exclude_meta_patterns: List[re.Pattern],
     metadata_map: Dict[str, str],
-) -> Tuple[List[Tuple[str, str]], Dict[str, Any]]:
+) -> Tuple[List[Tuple[str, str]], Dict[str, Any], Dict[str, str]]:
     """
     Returns:
-      - chunk_sources: list of (source_key, text) that must be chunked
-      - meta: metadata dict
-
-    Precedence (highest → lowest):
-      A) EXCLUDES:
-         - if key in exclude_chunk_keys → NEVER chunk (even if > threshold or forced)
-         - if key in exclude_meta_keys  → NEVER metadata
-         - if key in both excludes     → skip entirely (neither chunk nor meta)
-      B) FORCES (only applied if not excluded):
-         - key in force_chunk_keys → chunk (if non-empty)
-         - key in force_meta_keys  → metadata
-      C) DEFAULT:
-         - len(stringified value) > threshold → chunk
-         - else → metadata
-
-    metadata_map applies on top (source-key based). If mapped source_key is in exclude_meta_keys,
-    that mapping is skipped.
+      - chunk_sources: list of (path, text)
+      - meta:          dict of { meta_key_or_path: text }
+      - meta_origin:   dict of { meta_key_or_path: source_path_for_this_meta }
+                       (for path-like meta, origin == that path; for mapped out-keys, origin == mapped source path)
     """
+    flat = flatten_item(item)
+    flat_lc = {k.lower(): (k, v) for k, v in flat.items()}
+
     chunk_sources: List[Tuple[str, str]] = []
     meta: Dict[str, Any] = {}
+    meta_origin: Dict[str, str] = {}
 
-    # map lowercase->original for case-insensitive lookups
-    lower_item = {str(k).lower(): k for k in item.keys()}
+    for path_lc, (path, text) in flat_lc.items():
+        ex_chunk = _match_any(path_lc, exclude_chunk_patterns)
+        ex_meta  = _match_any(path_lc, exclude_meta_patterns)
+        if ex_chunk and ex_meta:
+            continue  # drop entirely
 
-    for orig_key, value in item.items():
-        key_lc = str(orig_key).lower()
-        text = _stringify(value)
-
-        # ---- EXCLUDES take absolute priority ----
-        in_excl_chunk = key_lc in exclude_chunk_keys
-        in_excl_meta  = key_lc in exclude_meta_keys
-
-        if in_excl_chunk and in_excl_meta:
-            # drop entirely
+        if _match_any(path_lc, force_chunk_patterns) and not ex_chunk:
+            if text.strip():
+                chunk_sources.append((path, text))
+            continue
+        if _match_any(path_lc, force_meta_patterns) and not ex_meta:
+            meta[path] = text
+            meta_origin[path] = path  # path-like meta
             continue
 
-        if key_lc in force_chunk_keys and not in_excl_chunk:
+        if not ex_chunk and len(text) > threshold:
             if text.strip():
-                chunk_sources.append((orig_key, text))
-            continue  # don't also duplicate into metadata
-
-        if key_lc in force_meta_keys and not in_excl_meta:
-            meta[orig_key] = text
-            continue
-
-        # Default rule by length
-        if not in_excl_chunk and len(text) > threshold:
-            if text.strip():
-                chunk_sources.append((orig_key, text))
+                chunk_sources.append((path, text))
         else:
-            if not in_excl_meta:
-                meta[orig_key] = text
-            # else: excluded from metadata → drop
+            if not ex_meta:
+                meta[path] = text
+                meta_origin[path] = path
 
-    # Apply metadata_map overrides (only if the SOURCE key is not excluded from metadata)
+    # metadata_map: out_key -> source_path
     if metadata_map:
-        for out_key, source_key in metadata_map.items():
-            sk_lc = str(source_key).lower()
-            src_orig = lower_item.get(sk_lc, source_key)
-            if sk_lc in exclude_meta_keys:
-                # user explicitly blocked this source from metadata
+        for out_key, source_path in metadata_map.items():
+            sp = str(source_path).lower().strip()
+            src = flat_lc.get(sp)
+            if not src:
+                # unique tail fallback
+                tail = sp.split(".")[-1]
+                candidates = [kv for k, kv in flat_lc.items() if k.endswith("." + tail) or k.endswith("]" + "." + tail)]
+                if len(candidates) == 1:
+                    src = candidates[0]
+            if not src:
                 continue
-            meta[out_key] = format_metadata_value(out_key, item.get(src_orig))
+            path, val = src
+            if _match_any(path.lower(), exclude_meta_patterns):
+                continue
+            meta[out_key] = format_metadata_value(out_key, val)
+            meta_origin[out_key] = path  # mapped meta remembers its source path
 
-    return chunk_sources, meta
+    return chunk_sources, meta, meta_origin
 
-# ==================== Background Task (Public) ====================
+
+
+# ===================== Background task (public) =====================
 
 def process_flexible_task(app, data):
     """
-    Inputs:
-      (same required headers & fields as /upload-flexible-smart)
-      NEW fields:
-        - threshold: int (default 70)
-        - force_chunk_keys: CSV or JSON array of keys to ALWAYS chunk
-        - force_meta_keys:  CSV or JSON array of keys to ALWAYS metadata
-        - exclude_chunk_keys: CSV or JSON array of keys to NEVER chunk (even if > threshold or forced)
-        - exclude_meta_keys:  CSV or JSON array of keys to NEVER metadata (drop from meta)
+    Flexible, nested, wildcard-aware embedding.
 
-    Behavior:
-      - If a field is in both exclude lists → dropped entirely.
-      - If an item produces NO non-empty chunks → NO ROW is inserted (no empty rows).
+    Input fields (from form-data):
+      - openai_key (header)       : x-openai-api-key
+      - supabase_url (header)     : x-supabase-url
+      - supabase_key (header)     : x-supabase-key
+      - file_url                  : json_url
+      - supabase_table            : default 'documents'
+      - chunk_size                : default 500
+      - chunk_overlap             : default 50
+      - metadata_map (JSON str)   : e.g. {"title":"metadata.title"}
+      - threshold                 : default 70
+      - force_chunk_keys          : CSV or JSON array (dot-path/wildcards supported)
+      - force_meta_keys           : CSV or JSON array
+      - exclude_chunk_keys        : CSV or JSON array
+      - exclude_meta_keys         : CSV or JSON array
+
+    Semantics:
+      - Simple token 'crawl' => drop subtree (root) + any leaf named 'crawl'
+      - Simple token 'loadedUrl' => drop any leaf named 'loadedUrl' anywhere
+      - Complex token 'a.b', 'a[*].c', 'a.*' => use as explicit path pattern
+      - Priority: exclude > force > threshold
+      - No empty rows inserted (if no non-empty chunks)
     """
     with app.app_context():
         try:
@@ -271,24 +396,35 @@ def process_flexible_task(app, data):
             supabase_key   = data["supabase_key"]
             file_url       = data["file_url"]
 
-            # existing knobs
             chunk_size     = int(data.get("chunk_size", 500))
             chunk_overlap  = int(data.get("chunk_overlap", 50))
             supabase_table = data.get("supabase_table", "documents")
             metadata_map   = data.get("metadata_map", {}) or {}
 
-            # dynamic knobs
             threshold         = int(data.get("threshold", 70))
-            force_chunk       = _parse_key_list(data.get("force_chunk_keys"))
-            force_meta        = _parse_key_list(data.get("force_meta_keys"))
-            exclude_chunk     = _parse_key_list(data.get("exclude_chunk_keys"))
-            exclude_meta      = _parse_key_list(data.get("exclude_meta_keys"))
+            force_chunk_raw   = _parse_key_list(data.get("force_chunk_keys"))
+            force_meta_raw    = _parse_key_list(data.get("force_meta_keys"))
+            exclude_chunk_raw = _parse_key_list(data.get("exclude_chunk_keys"))
+            exclude_meta_raw  = _parse_key_list(data.get("exclude_meta_keys"))
+            global_meta_raw = _parse_key_list(data.get("global_meta_keys"))
+
+            # Compile matchers once per request
+            force_chunk_patterns   = _compile_patterns(force_chunk_raw)
+            force_meta_patterns    = _compile_patterns(force_meta_raw)
+            exclude_chunk_patterns = _compile_patterns(exclude_chunk_raw)
+            exclude_meta_patterns  = _compile_patterns(exclude_meta_raw)
 
             if not openai_key or not supabase_url or not supabase_key or not file_url:
                 raise ValueError("Missing required configuration values (keys, supabase, or file_url).")
 
             json_str  = download_json_from_url(file_url)
             json_data = json.loads(json_str)
+
+            # Accept array or single object
+            if isinstance(json_data, dict):
+                json_data = [json_data]
+            elif not isinstance(json_data, list):
+                raise ValueError("Input JSON must be an object or an array of objects.")
 
             max_batch_size       = 128
             supabase_batch_size  = 100
@@ -299,33 +435,59 @@ def process_flexible_task(app, data):
             sess = requests.Session()
 
             for item in json_data:
-                chunk_sources, base_meta = decide_chunk_or_meta_for_item(
-                    item, threshold,
-                    force_chunk, force_meta,
-                    exclude_chunk, exclude_meta,
+                chunk_sources, base_meta, meta_origin = decide_chunk_or_meta_for_item_paths(
+                    item,
+                    threshold,
+                    force_chunk_patterns, force_meta_patterns,
+                    exclude_chunk_patterns, exclude_meta_patterns,
                     metadata_map
                 )
 
-                # If there are no sources to chunk → SKIP (do NOT insert empty row)
                 if not chunk_sources:
-                    continue
+                    continue  # no empty rows
 
-                # For each chosen source field, chunk separately
-                for src_key, text in chunk_sources:
-                    chunks = chunk_text(text, chunk_size, chunk_overlap)
-                    for c in chunks:
+                for src_path, text in chunk_sources:
+                    root = _extract_root(src_path)
+                    for c in chunk_text(text, chunk_size, chunk_overlap):
                         if not c or not c.strip():
-                            continue  # skip empty chunk
+                            continue
+
+                        # --- keep only related meta ---
+                        related_meta = {}
+                        for k, v in base_meta.items():
+                            if ('.' in k) or ('[' in k):
+                                if _is_related_to_root(k, root):
+                                    related_meta[k] = v
+                            else:
+                                origin_path = meta_origin.get(k, "")
+                                if origin_path and _extract_root(origin_path).lower() == root.lower():
+                                    related_meta[k] = v
+
+                        # --- add global meta keys (always included if present) ---
+                        for g in global_meta_raw:
+                            for bk, bv in base_meta.items():
+                                # check match leaf name ignoring path
+                                leaf = bk.split(".")[-1].split("[")[-1].lower()
+                                if leaf == g.lower() or bk.lower() == g.lower():
+                                    related_meta[g] = bv
+
+                        # You may also want to keep a couple of global fields regardless (optional)
+                        # e.g., always include top-level 'url' if present under same item:
+                        # for g in ("url",):
+                        #     if g in base_meta:
+                        #         related_meta.setdefault(g, base_meta[g])
+
+                        # Add trace fields
+                        related_meta["source_field"] = src_path
+                        related_meta.setdefault("source_root", root)
+
                         batched_chunks.append(c)
-                        per_chunk_meta = dict(base_meta)
-                        per_chunk_meta["source_field"] = src_key
-                        batched_meta_list.append(per_chunk_meta)
+                        batched_meta_list.append(related_meta)
 
                         if len(batched_chunks) >= max_batch_size:
                             embeddings = batch_embed_text(
                                 batched_chunks, openai_key, app, max_batch_size=max_batch_size
                             )
-                            # Only non-empty chunks are here; safe to insert
                             records = [
                                 {
                                     "content": batched_chunks[i],
@@ -343,7 +505,7 @@ def process_flexible_task(app, data):
                             batched_chunks.clear()
                             batched_meta_list.clear()
 
-            # Flush remaining
+            # flush remainder
             if batched_chunks:
                 embeddings = batch_embed_text(batched_chunks, openai_key, app, max_batch_size=max_batch_size)
                 records = [
@@ -365,3 +527,5 @@ def process_flexible_task(app, data):
 
         except Exception as e:
             app.logger.error(f"[FLEX TASK ERROR] {str(e)}", exc_info=True)
+
+

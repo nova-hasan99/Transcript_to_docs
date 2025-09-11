@@ -72,6 +72,7 @@ def upload_flexible_smart():
             "threshold": request.form.get('threshold', 70),
             "force_chunk_keys": request.form.get('force_chunk_keys', ''),
             "force_meta_keys": request.form.get('force_meta_keys', ''),
+            "global_meta_keys": request.form.get('global_meta_keys', ''),
 
             # NEW: hard excludes/blocklists
             "exclude_chunk_keys": request.form.get('exclude_chunk_keys', ''),  # keys that must NEVER be chunked
