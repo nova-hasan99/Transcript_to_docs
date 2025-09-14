@@ -290,6 +290,48 @@ def _is_related_to_root(meta_key: str, root: str) -> bool:
     return False
 
 
+def _leaf_name(path: str) -> str:
+    """
+    Convert any path like 'metadata.data[0].robots' -> 'robots'
+    """
+    p = re.sub(r"\[\d+\]", "", path)  # strip [0], [12], ...
+    return p.split(".")[-1].lower()
+
+
+def _compress_meta_keys(meta: Dict[str, Any],
+                        meta_origin: Dict[str, str],
+                        mode: str = "leaf") -> Tuple[Dict[str, Any], Dict[str, str]]:
+    """
+    mode == 'leaf' হলে path-like key ('a.b[0].c') -> শুধু leaf 'c'
+    collision হলে suffix (_2, _3 ...) দিয়ে ইউনিক রাখা হয়।
+    mapped out-key (metadata_map দিয়ে আসা key) অপরিবর্তিত থাকে।
+    """
+    if mode != "leaf":
+        return meta, meta_origin
+
+    new_meta: Dict[str, Any] = {}
+    new_origin: Dict[str, str] = {}
+
+    for k, v in meta.items():
+        path_like = ('.' in k) or ('[' in k)
+        if path_like:
+            leaf = _leaf_name(k)
+            nk = leaf
+            i = 2
+            while nk in new_meta:
+                nk = f"{leaf}_{i}"
+                i += 1
+            new_meta[nk] = v
+            new_origin[nk] = meta_origin.get(k, k)
+        else:
+            # mapped out-keys or simple keys 그대로 রাখি
+            new_meta[k] = v
+            new_origin[k] = meta_origin.get(k, k)
+
+    return new_meta, new_origin
+
+
+
 # ===================== Decision (path-aware) =====================
 
 def decide_chunk_or_meta_for_item_paths(
@@ -400,6 +442,8 @@ def process_flexible_task(app, data):
             chunk_overlap  = int(data.get("chunk_overlap", 50))
             supabase_table = data.get("supabase_table", "documents")
             metadata_map   = data.get("metadata_map", {}) or {}
+            
+            meta_key_mode   = data.get("meta_key_mode", "leaf")
 
             threshold         = int(data.get("threshold", 70))
             force_chunk_raw   = _parse_key_list(data.get("force_chunk_keys"))
@@ -452,34 +496,23 @@ def process_flexible_task(app, data):
                         if not c or not c.strip():
                             continue
 
-                        # --- keep only related meta ---
-                        related_meta = {}
-                        for k, v in base_meta.items():
-                            if ('.' in k) or ('[' in k):
-                                if _is_related_to_root(k, root):
-                                    related_meta[k] = v
-                            else:
-                                origin_path = meta_origin.get(k, "")
-                                if origin_path and _extract_root(origin_path).lower() == root.lower():
-                                    related_meta[k] = v
+                        # --- keep ALL meta from this item (no root filter) ---
+                        related_meta = dict(base_meta)
 
-                        # --- add global meta keys (always included if present) ---
+                        # --- add/override explicit global meta keys if requested (optional, same logic) ---
                         for g in global_meta_raw:
+                            gl = g.lower()
                             for bk, bv in base_meta.items():
-                                # check match leaf name ignoring path
-                                leaf = bk.split(".")[-1].split("[")[-1].lower()
-                                if leaf == g.lower() or bk.lower() == g.lower():
+                                # leaf match or full-path match
+                                if _leaf_name(bk) == gl or bk.lower() == gl:
                                     related_meta[g] = bv
 
-                        # You may also want to keep a couple of global fields regardless (optional)
-                        # e.g., always include top-level 'url' if present under same item:
-                        # for g in ("url",):
-                        #     if g in base_meta:
-                        #         related_meta.setdefault(g, base_meta[g])
-
-                        # Add trace fields
+                        # Add trace field (ONLY source_field; DO NOT save source_root)
                         related_meta["source_field"] = src_path
-                        related_meta.setdefault("source_root", root)
+
+                        # compress path-like meta keys to leaf names (e.g., 'metadata.data[0].robots' -> 'robots')
+                        related_meta, _ = _compress_meta_keys(related_meta, meta_origin, mode=meta_key_mode)
+
 
                         batched_chunks.append(c)
                         batched_meta_list.append(related_meta)

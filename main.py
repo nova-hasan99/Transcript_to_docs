@@ -77,6 +77,8 @@ def upload_flexible_smart():
             # NEW: hard excludes/blocklists
             "exclude_chunk_keys": request.form.get('exclude_chunk_keys', ''),  # keys that must NEVER be chunked
             "exclude_meta_keys": request.form.get('exclude_meta_keys', ''),    # keys that must NEVER be metadata
+            
+            "meta_key_mode": request.form.get('meta_key_mode', 'leaf'),
         }
 
         th = Thread(target=process_flexible_task, args=(app, data), name="flex-embed-uploader")
