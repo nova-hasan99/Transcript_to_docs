@@ -3,6 +3,7 @@ from transcript_to_docs import generate_zip_from_transcript
 from error_log import error_log_bp
 from vector_embedding import process_upload_task
 from flexible_embedding import process_flexible_task
+from services import embed_text, call_supabase_rpc 
 from threading import Thread
 import json
 
@@ -93,6 +94,50 @@ def upload_flexible_smart():
 
     except Exception as e:
         app.logger.error(f"Upload smart request failed: {str(e)}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+    
+
+#....................................... new endpoint for /ask ............................
+@app.route("/ask", methods=["POST"])
+def ask():
+    try:
+        # ---- credentials from headers ----
+        openai_key = request.headers.get("x-openai-api-key")
+        supabase_url = request.headers.get("x-supabase-url")
+        supabase_key = request.headers.get("x-supabase-key")
+
+        # ---- params from body ----
+        data = request.get_json(silent=True) or {}
+        question = data.get("question", "").strip()
+        rpc_name = data.get("rpc_name", "match_documents")
+        match_count = int(data.get("match_count", 5))
+
+        # ---- validation ----
+        missing = []
+        if not openai_key: missing.append("x-openai-api-key")
+        if not supabase_url: missing.append("x-supabase-url")
+        if not supabase_key: missing.append("x-supabase-key")
+        if not question: missing.append("question")
+
+        if missing:
+            return jsonify({"error": "Missing required fields", "missing": missing}), 400
+
+        # ---- pipeline ----
+        embedding = embed_text(question, openai_key)
+        matches = call_supabase_rpc(
+            supabase_url, supabase_key, rpc_name, embedding, match_count
+        )
+
+        return jsonify({
+            "status": "success",
+            "rpc_used": rpc_name,
+            "match_count": match_count,
+            "question": question,
+            "matches": matches
+        }), 200
+
+    except Exception as e:
+        app.logger.error(f"/ask request failed: {str(e)}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
