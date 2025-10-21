@@ -7,10 +7,14 @@ from services import embed_text, call_supabase_rpc
 from threading import Thread
 import json
 
+from format_video import format_bp    # Format video blueprint
+
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB max upload
 
 app.register_blueprint(error_log_bp)
+
+app.register_blueprint(format_bp)   # Register format video blueprint
 
 @app.route("/ping")
 def ping():
