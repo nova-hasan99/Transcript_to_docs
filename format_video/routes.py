@@ -1,19 +1,16 @@
 # format_video/routes.py
 from flask import Blueprint, request, jsonify, send_from_directory, current_app
-import os, ffmpeg, uuid, glob, threading
+import os, ffmpeg, uuid, glob, threading, requests
 
 format_bp = Blueprint("format_bp", __name__)
 
-# outputs will live inside this package folder
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# in-memory job store
 JOBS = {}
 
 
 def clear_old_outputs():
-    """Delete all old formatted videos before each new request."""
+    """Delete old formatted videos before new processing"""
     for f in glob.glob(os.path.join(OUTPUT_DIR, "*")):
         try:
             os.remove(f)
@@ -21,35 +18,33 @@ def clear_old_outputs():
             pass
 
 
+def download_video_from_url(url, save_path):
+    """Download video file from provided URL"""
+    response = requests.get(url, stream=True, timeout=60)
+    if response.status_code != 200:
+        raise Exception(f"Failed to download video. HTTP {response.status_code}")
+    with open(save_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            f.write(chunk)
+
+
 def process_video(app, base_url, format_job_id, filepath, resize_data):
-    """Background formatter. No url_for() here to avoid SERVER_NAME / context issues."""
+    """Background processing of video resize"""
     with app.app_context():
         try:
             output_links = []
-
             for platform, size in resize_data.items():
-                try:
-                    width, height = map(int, size.split(","))
-                except ValueError:
-                    JOBS[format_job_id]["status"] = "error"
-                    JOBS[format_job_id]["error"] = f"Invalid size format for {platform}. Use 'width,height'"
-                    # clean input
-                    if os.path.exists(filepath): os.remove(filepath)
-                    return
-
-                # output file name exactly as the platform key
+                width, height = map(int, size.split(","))
                 output_filename = f"{platform}.mp4"
                 output_path = os.path.join(OUTPUT_DIR, output_filename)
 
-                # scale to fill & crop
                 vf_filter = (
                     f"scale={width}:{height}:force_original_aspect_ratio=increase,"
                     f"crop={width}:{height}"
                 )
 
                 (
-                    ffmpeg
-                    .input(filepath)
+                    ffmpeg.input(filepath)
                     .output(
                         output_path,
                         vf=vf_filter,
@@ -64,12 +59,10 @@ def process_video(app, base_url, format_job_id, filepath, resize_data):
                     .run(quiet=True)
                 )
 
-                # ✅ Build URL WITHOUT url_for() to avoid SERVER_NAME / request context issues
-                download_path = f"/download/{output_filename}"
-                download_url = f"{base_url}{download_path}"
+                # Build dynamic download link
+                download_url = f"{base_url}/download/{output_filename}"
                 output_links.append({platform: download_url})
 
-            # delete temp input
             if os.path.exists(filepath):
                 os.remove(filepath)
 
@@ -79,39 +72,46 @@ def process_video(app, base_url, format_job_id, filepath, resize_data):
         except Exception as e:
             JOBS[format_job_id]["status"] = "error"
             JOBS[format_job_id]["error"] = str(e)
-            if os.path.exists(filepath): os.remove(filepath)
+            if os.path.exists(filepath):
+                os.remove(filepath)
 
 
 @format_bp.route("/format", methods=["POST"])
 def format_video():
-    """Accepts: form-data -> video + any number of <platform>=width,height pairs."""
-    if "video" not in request.files:
-        return jsonify({"error": "No video file uploaded"}), 400
-
+    """Accepts: form-data => video_url + any number of <platform>=width,height"""
+    video_url = request.form.get("video_url")
     resize_data = request.form.to_dict()
+
+    # Remove video_url key from resize_data so only platform info stays
+    resize_data.pop("video_url", None)
+
+    if not video_url:
+        return jsonify({"error": "Missing video_url"}), 400
     if not resize_data:
         return jsonify({"error": "No resize data provided"}), 400
 
-    # wipe old formatted files
     clear_old_outputs()
-
-    # new job
     format_job_id = str(uuid.uuid4())
     JOBS[format_job_id] = {"status": "processing", "download_links": []}
 
-    # save temp input
-    file = request.files["video"]
-    filename = f"{uuid.uuid4()}_{file.filename}"
+    filename = f"{uuid.uuid4()}.mp4"
     filepath = os.path.join(OUTPUT_DIR, filename)
-    file.save(filepath)
 
-    # auto-detect base URL (works for localhost, IP, domain, https)
+    try:
+        # Download video first
+        download_video_from_url(video_url, filepath)
+    except Exception as e:
+        JOBS[format_job_id]["status"] = "error"
+        JOBS[format_job_id]["error"] = str(e)
+        return jsonify({"error": f"Failed to download: {str(e)}"}), 400
+
     base_url = request.host_url.rstrip("/")
-
-    # run in background
     app = current_app._get_current_object()
-    t = threading.Thread(target=process_video, args=(app, base_url, format_job_id, filepath, resize_data), daemon=True)
-    t.start()
+
+    thread = threading.Thread(
+        target=process_video, args=(app, base_url, format_job_id, filepath, resize_data), daemon=True
+    )
+    thread.start()
 
     return jsonify({
         "status": "processing",
